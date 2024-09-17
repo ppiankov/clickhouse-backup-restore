@@ -26,45 +26,82 @@ if [ ! -d "$RESTORE_ROOT" ]; then
     exit 1
 fi
 
+# Function to execute ClickHouse queries
+execute_query() {
+    local query="$1"
+    local database="$2"
+    local args="--host=$TARGET_HOST --port=$TARGET_PORT --user=$TARGET_USER --password=$TARGET_PASSWORD"
+
+    if [ -n "$database" ]; then
+        args="$args --database=$database"
+    fi
+
+    echo "$query" | clickhouse-client $args
+}
+
+# Function to process schema content
+process_schema() {
+    local content="$1"
+    # Replace '\n' with actual newlines
+    content=$(echo "$content" | sed 's/\\n/\n/g')
+    # Fix DateTime with timezone using Perl
+    content=$(echo "$content" | perl -pe 's/DateTime\((\\?'\''[^'\'']+\\?'\'')\)/DateTime($1)/g')
+    # Remove any remaining backslashes
+    content=$(echo "$content" | sed 's/\\//g')
+    echo "$content"
+}
+
 # Check and restore each database
 for db_dir in "$RESTORE_ROOT"/*; do
     if [ -d "$db_dir" ]; then
         database_name=$(basename "$db_dir")
 
         # Check if database exists on the target server
-        EXISTS=$(clickhouse-client --host="$TARGET_HOST" --port="$TARGET_PORT" --user="$TARGET_USER" --password="$TARGET_PASSWORD" --query="EXISTS DATABASE $database_name" --format=TSV)
+        EXISTS=$(execute_query "EXISTS DATABASE $database_name" "" --format=TSV)
 
-        if [[ "$EXISTS" == "1" ]]; then
-            echo "Database $database_name already exists on the target server. Skipping..."
-            continue
+        if [[ "$EXISTS" != "1" ]]; then
+            echo "Creating database: $database_name on the target server"
+            execute_query "CREATE DATABASE IF NOT EXISTS $database_name"
+        else
+            echo "Database $database_name already exists on the target server."
         fi
-
-        # Create database on the target server
-        echo "Creating database: $database_name on the target server"
-        clickhouse-client --host="$TARGET_HOST" --port="$TARGET_PORT" --user="$TARGET_USER" --password="$TARGET_PASSWORD" --query="CREATE DATABASE IF NOT EXISTS $database_name"
 
         # Directory for schema files
         SCHEMA_DIR="$db_dir/schemas"
+        echo "Processing schemas in $SCHEMA_DIR"
 
         # Restore tables from schema files
         for schema_file in "$SCHEMA_DIR"/*.sql; do
-          table_name=$(basename "$schema_file" .sql)
-          echo "Creating table: $table_name in database: $database_name"
+            table_name=$(basename "$schema_file" .sql)
+            echo "Creating table: $table_name in database: $database_name"
 
-          # Read schema file and remove backslashes using sed
-' | sed 's/\\n//g' | sed 's/\\//g' )ema_file" | tr -d '
+            # Read schema file, process content, and execute
+            SCHEMA_CONTENT=$(cat "$schema_file")
+            SCHEMA_CONTENT=$(process_schema "$SCHEMA_CONTENT")
 
-          # Execute clickhouse-client with processed schema content
-          clickhouse-client --host="$TARGET_HOST" --port="$TARGET_PORT" --user="$TARGET_USER" --password="$TARGET_PASSWORD" --database="$database_name" --multiquery --query="$SCHEMA_CONTENT"
+            # Debug output for all tables
+            echo "Debug: Processed SQL for $table_name:"
+            echo "$SCHEMA_CONTENT"
+
+            execute_query "$SCHEMA_CONTENT" "$database_name"
         done
+
         # Restore data from native files
         for table_file in "$db_dir"/*.native; do
             if [ -f "$table_file" ] && [ -s "$table_file" ]; then  # Check if file exists and is not empty
                 table_name=$(basename "$table_file" .native)
-                echo "Restoring table: $table_name to database: $database_name"
-                clickhouse-client --host="$TARGET_HOST" --port="$TARGET_PORT" --user="$TARGET_USER" --password="$TARGET_PASSWORD" --database="$database_name" --query="INSERT INTO $table_name FORMAT Native" < "$table_file"
+                echo "Restoring data for table: $table_name in database: $database_name"
+
+                # Check if table exists before attempting to insert data
+                TABLE_EXISTS=$(execute_query "EXISTS TABLE $table_name" "$database_name" --format=TSV)
+
+                if [[ "$TABLE_EXISTS" == "1" ]]; then
+                    cat "$table_file" | clickhouse-client --host=$TARGET_HOST --port=$TARGET_PORT --user=$TARGET_USER --password=$TARGET_PASSWORD --database=$database_name --query="INSERT INTO $table_name FORMAT Native"
+                else
+                    echo "Table $table_name does not exist in database $database_name. Skipping data insertion."
+                fi
             else
-                echo "No data to insert for table: $table_name from file: $table_file"
+                echo "No data file or empty file for table: $table_name"
             fi
         done
     fi
